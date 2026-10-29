@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 TEMP_DIR = DATA_DIR / "temp"
@@ -21,5 +21,8 @@ class Settings(BaseModel):
     default_retention_hours: int = int(os.getenv("RETENTION_HOURS", "24"))
     enable_whisper: bool = os.getenv("ENABLE_WHISPER", "true").lower() in ("true", "1", "yes")
     default_whisper_model: str = os.getenv("WHISPER_MODEL", "tiny")
+    cors_origins: list[str] = [
+        o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()
+    ]
 
 settings = Settings()

@@ -5,53 +5,107 @@ ClipForge AI automatically analyzes long-form videos (podcasts, gameplay, interv
 
 ---
 
-## 🚀 How to Run the App
+## 🏗️ Architecture & Frameworks
+
+- **Backend**: Python 3.11+ / FastAPI / Uvicorn / PySceneDetect / FFmpeg / yt-dlp / httpx
+- **Frontend**: React 19 / TypeScript / Vite / Tailwind CSS / Lucide React
+- **Video Pipeline**: FFmpeg custom filter-chain (blurred bokeh background padding, dynamic scale & crop, AAC audio normalization, +faststart MP4 streaming)
+- **Deployment**: Dockerized backend on Render + Static Single Page Application (SPA) on Vercel or Render Static Site
+
+---
+
+## 🚀 Local Development
 
 ### Option 1: One-Click Quick Start (Windows)
-Double-click the **`run.bat`** file in this folder, or run:
+Double-click **`run.bat`** or run:
 ```bat
 .\run.bat
 ```
-This opens the backend (port 8000), frontend (port 5173), and automatically launches your browser.
+
+### Option 2: Run via Terminal
+1. **Backend** (from project root):
+   ```powershell
+   .\venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+   ```
+2. **Frontend** (in separate terminal):
+   ```powershell
+   cd frontend
+   npm run dev
+   ```
 
 ---
 
-### Option 2: Run via Terminal (PowerShell / Command Prompt)
+## 🌐 Production Internet Deployment Guide
 
-Open two terminal windows in the project directory `c:\Users\prasa\OneDrive\Desktop\ClipForge AI`:
-
-#### Terminal 1: Backend Server (FastAPI)
-```powershell
-.\venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
-```
-*Backend runs on `http://127.0.0.1:8000` (API documentation at `/docs`).*
-
-#### Terminal 2: Frontend Server (Vite React)
-```powershell
-cd frontend
-npm run dev
-```
-*Frontend runs on `http://127.0.0.1:5173`.*
+Recommended Cloud Architecture:
+- **Backend**: [Render Web Service](https://render.com) (Docker Runtime)
+- **Frontend**: [Vercel](https://vercel.com) (Vite React SPA)
 
 ---
 
-### Option 3: Single-Server Production Mode
-Because the frontend is pre-built into `frontend/dist`, you can also run the entire website using only the FastAPI backend:
-```powershell
-.\venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
-```
-Open **[http://localhost:8000](http://localhost:8000)** in your browser.
+### Step 1: Deploy Backend on Render (Web Service)
+
+1. Sign up/Log in at [dashboard.render.com](https://dashboard.render.com).
+2. Click **New +** &rarr; **Web Service**.
+3. Connect your GitHub repository: `PrasadGhadge-WebDev/Ai-clip`.
+4. Configure the settings:
+   - **Name**: `clipforge-backend`
+   - **Region**: Nearest to your users (e.g., `Oregon (US West)` or `Frankfurt (EU)`)
+   - **Branch**: `main`
+   - **Runtime**: **`Docker`** *(Uses the included `Dockerfile` with native FFmpeg & OpenCV pre-installed)*
+   - **Instance Type**: **Free**
+5. Under **Environment Variables**, add:
+   - `PORT`: `8000`
+   - `CORS_ORIGINS`: `*` *(or your Vercel URL once deployed)*
+   - `MAX_UPLOAD_SIZE_MB`: `500`
+   - `RETENTION_HOURS`: `24`
+6. Click **Create Web Service**.
+7. Once deployed, copy your backend URL (e.g. `https://clipforge-backend.onrender.com`).
 
 ---
 
-## 🛠️ Features
-- **Local File Upload & Link Import**: Drag-and-drop local video files or paste links from YouTube, Shorts, Vimeo, or direct MP4 URLs.
-- **Smart Slicing Strategies**:
-  - **Scene Cut Detection**: Powered by PySceneDetect.
-  - **Silence Removal**: Detects speech pauses with FFmpeg silencedetect.
-  - **Duration Chunks**: Uniform social-optimized intervals.
-  - **Speech-Aware Cuts**: Sentence-level alignment with faster-whisper.
-- **Aspect Ratio Re-Framing**: 9:16 (Vertical Shorts/Reels/TikTok), 1:1 (Square), 16:9 (Landscape) with smart blurred padding.
-- **In-Browser Video Streaming**: HTTP 206 partial content streaming player.
-- **Batch Export**: Instant individual MP4 downloads or full ZIP package bundle.
+### Step 2: Deploy Frontend on Vercel
 
+1. Log in at [vercel.com](https://vercel.com).
+2. Click **Add New...** &rarr; **Project**.
+3. Import your repository: `PrasadGhadge-WebDev/Ai-clip`.
+4. Configure Project Settings:
+   - **Framework Preset**: `Vite`
+   - **Root Directory**: Click *Edit* and select **`frontend`**
+   - **Build Command**: `npm run build`
+   - **Output Directory**: `dist`
+5. Under **Environment Variables**, add:
+   - **Key**: `VITE_API_BASE_URL`
+   - **Value**: `https://clipforge-backend.onrender.com` *(your Render backend URL from Step 1)*
+6. Click **Deploy**.
+7. Your frontend will be live on `https://your-project.vercel.app`!
+
+*(Optional: Go back to Render Dashboard &rarr; Environment &rarr; set `CORS_ORIGINS=https://your-project.vercel.app` for strict security).*
+
+---
+
+## ⚠️ Cloud & Free-Tier Operational Considerations
+
+1. **Free Tier Inactivity Sleep (Render)**:
+   - On Render Free Tier, the backend spins down after 15 minutes of inactivity.
+   - The first request after sleep may take ~30–50 seconds to wake up.
+   - *Tip*: Free cron services like UptimeRobot or Cron-Job.org can ping `/api/health` every 14 minutes to keep it active.
+2. **Ephemeral Disk vs Persistent Storage**:
+   - Render Free Tier has an ephemeral file system. Uploaded videos and rendered clips remain accessible during the user session, but are wiped when the container sleeps or redeploys.
+   - For long-term permanent storage, mount a **Render Persistent Disk** at `/var/data` and set `DATA_DIR=/var/data` in environment variables.
+3. **Long Video Processing & Timeout Protection**:
+   - ClipForge AI creates jobs asynchronously and returns `job_id` within 20 milliseconds.
+   - The frontend polls `/api/jobs/{id}` every 1.5s, preventing the cloud proxy 100-second request timeout.
+   - For heavy 1+ hour videos on CPU instances, configure `max_clips` or 720p for faster turnaround.
+
+---
+
+## ✅ Post-Deployment Verification Checklist
+
+- [ ] Visit `https://<your-backend>.onrender.com/api/health` &rarr; returns `status: "healthy"` and `ffmpeg.installed: true`.
+- [ ] Visit `https://<your-frontend>.vercel.app` &rarr; header shows `Engine Active` with green status dot.
+- [ ] Click **"Generate Demo Video"** &rarr; 15-second sample generates in seconds.
+- [ ] Click **"Paste Video Link"** &rarr; paste YouTube URL (`https://www.youtube.com/watch?v=...`) &rarr; metadata loads.
+- [ ] Click **"Forge Social Clips Now"** &rarr; live progress bar tracks rendering stages.
+- [ ] Review clips in gallery &rarr; test in-browser video streaming modal.
+- [ ] Click **"Download All (ZIP)"** &rarr; ZIP package downloads successfully.

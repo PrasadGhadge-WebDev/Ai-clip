@@ -1,6 +1,11 @@
 import type { SystemHealth, UploadResponse, Job, JobOptions } from './types';
 
-const API_BASE = '/api';
+const RAW_BASE = import.meta.env.VITE_API_BASE_URL || '';
+export const API_BASE = (() => {
+  if (!RAW_BASE) return '/api';
+  const clean = RAW_BASE.replace(/\/+$/, '');
+  return clean.endsWith('/api') ? clean : `${clean}/api`;
+})();
 
 export async function fetchHealth(): Promise<SystemHealth> {
   const res = await fetch(`${API_BASE}/health`);
