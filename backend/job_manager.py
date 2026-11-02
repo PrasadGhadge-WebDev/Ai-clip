@@ -9,11 +9,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 
-from .config import DATA_DIR, OUTPUT_DIR, TEMP_DIR
+from .config import DATA_DIR, OUTPUT_DIR, TEMP_DIR, UPLOAD_DIR, settings
 from .ffmpeg_utils import get_video_metadata, cut_clip, generate_thumbnail
 from .scene_detector import detect_scenes
 from .silence_detector import extract_active_speech_segments, SILENCE_REMOVAL_EXPLANATION
 from .transcriber import transcribe_video, get_speech_aware_cuts, generate_srt_content, WHISPER_LIMITATIONS_DISCLOSURE
+from .s3_storage import s3_storage
+from .url_downloader import download_video_from_url
 
 logger = logging.getLogger("clipforge.jobmanager")
 
@@ -24,7 +26,19 @@ class JobManager:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self.lock = threading.Lock()
+        self.listeners: List[Any] = []
         self._load_state()
+
+    def register_listener(self, fn: Any):
+        """Registers a callback for real-time WebSocket state broadcasting."""
+        self.listeners.append(fn)
+
+    def _notify_listeners(self, job_id: str, job_dict: Dict[str, Any]):
+        for listener in list(self.listeners):
+            try:
+                listener(job_id, job_dict)
+            except Exception as e:
+                logger.debug(f"Listener error: {e}")
 
     def _save_state(self):
         """Serializes non-sensitive job states to JSON."""
@@ -71,26 +85,40 @@ class JobManager:
             if job_id in self.jobs:
                 self.jobs[job_id].update(kwargs)
                 self.jobs[job_id]["updated_at"] = time.time()
+                updated_data = dict(self.jobs[job_id])
+            else:
+                updated_data = None
+        if updated_data:
+            self._notify_listeners(job_id, updated_data)
         self._save_state()
 
     def create_job(
         self,
-        input_file_path: Path,
-        original_filename: str,
-        options: Dict[str, Any]
+        input_file_path: Optional[Path] = None,
+        original_filename: str = "video",
+        options: Optional[Dict[str, Any]] = None,
+        video_url: Optional[str] = None,
+        s3_key: Optional[str] = None
     ) -> Dict[str, Any]:
+        if options is None:
+            options = {}
         job_id = str(uuid.uuid4())
         job_dir = OUTPUT_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
+        initial_status = "downloading" if video_url else "queued"
+        initial_stage = "Queued: video link will download in background" if video_url else "Job queued for processing"
+
         job_data: Dict[str, Any] = {
             "id": job_id,
             "original_filename": original_filename,
-            "input_path": str(input_file_path),
+            "input_path": str(input_file_path) if input_file_path else "",
             "output_dir": str(job_dir),
-            "status": "queued",
+            "video_url": video_url,
+            "s3_key": s3_key,
+            "status": initial_status,
             "progress": 0,
-            "stage": "Job queued for processing",
+            "stage": initial_stage,
             "created_at": time.time(),
             "updated_at": time.time(),
             "options": {
@@ -106,6 +134,7 @@ class JobManager:
                 "silence_duration": float(options.get("silence_duration", 0.5)),
                 "enable_subtitles": bool(options.get("enable_subtitles", False)),
                 "whisper_model": options.get("whisper_model", "tiny"),
+                "max_clips": int(options.get("max_clips", 6)),
             },
             "clips": [],
             "logs": [],
@@ -117,6 +146,7 @@ class JobManager:
         with self.lock:
             self.jobs[job_id] = job_data
         self._save_state()
+        self._notify_listeners(job_id, job_data)
 
         # Submit to executor
         self.executor.submit(self._process_job, job_id)
@@ -233,12 +263,34 @@ class JobManager:
         if not job:
             return
 
-        input_path = Path(job["input_path"])
+        input_path = Path(job["input_path"]) if job.get("input_path") else None
         job_dir = Path(job["output_dir"])
         opts = job["options"]
 
         try:
-            self.update_job(job_id, status="analyzing", progress=5, stage="Probing video stream & metadata")
+            # Handle Asynchronous Video Link Download in Background Worker
+            if job.get("video_url"):
+                self.update_job(job_id, status="downloading", progress=5, stage="Downloading video stream from link in background...")
+                self.add_log(job_id, f"Downloading video from URL: {job['video_url']}")
+                dl_data = download_video_from_url(job["video_url"], UPLOAD_DIR, max_size_mb=settings.max_upload_size_mb)
+                input_path = UPLOAD_DIR / dl_data["file_id"]
+                self.update_job(job_id, input_path=str(input_path), original_filename=dl_data["filename"])
+                self.add_log(job_id, f"Video stream downloaded successfully: {dl_data['filename']}")
+
+            # Handle Decoupled Storage / S3 Key Download in Background Worker
+            elif job.get("s3_key"):
+                self.update_job(job_id, status="downloading", progress=5, stage="Fetching video file from S3 storage...")
+                self.add_log(job_id, f"Downloading S3 object: {job['s3_key']}")
+                dest = UPLOAD_DIR / Path(job["s3_key"]).name
+                s3_storage.download_file(job["s3_key"], dest)
+                input_path = dest
+                self.update_job(job_id, input_path=str(input_path))
+                self.add_log(job_id, "Video downloaded from S3 successfully.")
+
+            if not input_path or not input_path.exists():
+                raise FileNotFoundError("Video source file is missing or failed to download.")
+
+            self.update_job(job_id, status="analyzing", progress=15, stage="Probing video stream & metadata")
             self.add_log(job_id, f"Analyzing video: {input_path.name}")
 
             meta = get_video_metadata(input_path)

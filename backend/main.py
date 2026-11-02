@@ -2,9 +2,22 @@ import os
 import time
 import shutil
 import logging
+import asyncio
 from pathlib import Path
-from typing import Optional, List
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Header, Request, status
+from typing import Optional, List, Dict, Any
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Header,
+    Request,
+    status,
+    WebSocket,
+    WebSocketDisconnect
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -15,6 +28,7 @@ from .transcriber import is_whisper_available, WHISPER_LIMITATIONS_DISCLOSURE
 from .silence_detector import SILENCE_REMOVAL_EXPLANATION
 from .job_manager import job_manager
 from .url_downloader import download_video_from_url
+from .s3_storage import s3_storage
 from fastapi.staticfiles import StaticFiles
 
 # Configure logging
@@ -29,6 +43,46 @@ app = FastAPI(
     version=settings.version,
     description="Automated AI-powered video cutter for Instagram Reels, YouTube Shorts, and TikTok"
 )
+
+# Real-time WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, job_id: str, websocket: WebSocket):
+        await websocket.accept()
+        if job_id not in self.active_connections:
+            self.active_connections[job_id] = []
+        self.active_connections[job_id].append(websocket)
+
+    def disconnect(self, job_id: str, websocket: WebSocket):
+        if job_id in self.active_connections:
+            if websocket in self.active_connections[job_id]:
+                self.active_connections[job_id].remove(websocket)
+            if not self.active_connections[job_id]:
+                del self.active_connections[job_id]
+
+    async def broadcast_job(self, job_id: str, data: dict):
+        if job_id in self.active_connections:
+            dead = []
+            for ws in self.active_connections[job_id]:
+                try:
+                    await ws.send_json(data)
+                except Exception:
+                    dead.append(ws)
+            for d in dead:
+                self.disconnect(job_id, d)
+
+ws_manager = ConnectionManager()
+
+def on_job_state_changed(job_id: str, job_dict: dict):
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(ws_manager.broadcast_job(job_id, job_dict))
+    except RuntimeError:
+        pass
+
+job_manager.register_listener(on_job_state_changed)
 
 # CORS Middleware
 cors_origins = settings.cors_origins
@@ -52,7 +106,9 @@ else:
 
 
 class JobCreateRequest(BaseModel):
-    file_id: str
+    file_id: Optional[str] = None
+    video_url: Optional[str] = None
+    s3_key: Optional[str] = None
     cut_method: str = Field(default="scene", description="'scene' | 'silence' | 'duration' | 'speech'")
     aspect_ratio: str = Field(default="9:16", description="'9:16' | '16:9' | '1:1'")
     crop_mode: str = Field(default="blur_padding", description="'blur_padding' | 'center_crop' | 'fit_pad'")
@@ -65,6 +121,7 @@ class JobCreateRequest(BaseModel):
     silence_duration: float = Field(default=0.5, ge=0.1, le=5.0)
     enable_subtitles: bool = Field(default=False)
     whisper_model: str = Field(default="tiny")
+    max_clips: int = Field(default=6)
 
 
 @app.get("/api/health")
@@ -203,18 +260,81 @@ async def create_synthetic_sample():
         raise HTTPException(status_code=500, detail=f"Failed to generate synthetic sample: {str(e)}")
 
 
+class PresignedUrlRequest(BaseModel):
+    filename: str
+    content_type: str = "video/mp4"
+    file_size: Optional[int] = None
+
+
+@app.post("/api/storage/presigned-url")
+async def get_presigned_url(req: PresignedUrlRequest):
+    """Generates S3 Pre-signed URL for direct browser-to-bucket upload."""
+    if not s3_storage.enabled:
+        return {
+            "supported": False,
+            "message": "AWS S3 credentials not configured in backend environment. Direct backend streaming will be used."
+        }
+
+    if req.file_size and req.file_size > (settings.max_upload_size_mb * 1024 * 1024):
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds maximum upload size limit of {settings.max_upload_size_mb}MB"
+        )
+
+    try:
+        data = s3_storage.generate_presigned_upload_url(
+            filename=req.filename,
+            content_type=req.content_type
+        )
+        return {"supported": True, **data}
+    except Exception as e:
+        logger.error(f"Failed generating pre-signed URL: {e}")
+        raise HTTPException(status_code=500, detail=f"Pre-signed URL generation failed: {str(e)}")
+
+
+@app.websocket("/api/ws/jobs/{job_id}")
+async def job_progress_websocket(websocket: WebSocket, job_id: str):
+    """Real-time bidirectional WebSocket connection for live job state & logs streaming."""
+    await ws_manager.connect(job_id, websocket)
+    current = job_manager.get_job(job_id)
+    if current:
+        await websocket.send_json(current)
+    try:
+        while True:
+            await websocket.receive_text()
+    except (WebSocketDisconnect, Exception):
+        ws_manager.disconnect(job_id, websocket)
+
+
 @app.post("/api/jobs")
 async def create_processing_job(req: JobCreateRequest):
-    """Creates and starts an asynchronous video clipping job."""
-    input_path = UPLOAD_DIR / req.file_id
-    if not input_path.exists():
-        raise HTTPException(status_code=404, detail=f"Uploaded file '{req.file_id}' not found.")
+    """Creates and starts an asynchronous video clipping job from uploaded file, S3 key, or URL."""
+    if not req.file_id and not req.video_url and not req.s3_key:
+        raise HTTPException(
+            status_code=400,
+            detail="One of 'file_id', 'video_url', or 's3_key' must be provided."
+        )
+
+    input_path = None
+    original_filename = "video.mp4"
+
+    if req.file_id:
+        input_path = UPLOAD_DIR / req.file_id
+        if not input_path.exists():
+            raise HTTPException(status_code=404, detail=f"Uploaded file '{req.file_id}' not found.")
+        original_filename = req.file_id
+    elif req.video_url:
+        original_filename = "online_video.mp4"
+    elif req.s3_key:
+        original_filename = Path(req.s3_key).name
 
     options = req.model_dump()
     job = job_manager.create_job(
         input_file_path=input_path,
-        original_filename=req.file_id,
-        options=options
+        original_filename=original_filename,
+        options=options,
+        video_url=req.video_url,
+        s3_key=req.s3_key
     )
     return job
 

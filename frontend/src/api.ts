@@ -13,6 +13,56 @@ export async function fetchHealth(): Promise<SystemHealth> {
   return res.json();
 }
 
+export async function requestPresignedUrl(
+  filename: string,
+  contentType: string = 'video/mp4',
+  fileSize?: number
+): Promise<{ supported: boolean; upload_url?: string; object_key?: string }> {
+  const res = await fetch(`${API_BASE}/storage/presigned-url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename, content_type: contentType, file_size: fileSize }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to obtain pre-signed URL' }));
+    throw new Error(err.detail);
+  }
+  return res.json();
+}
+
+export function uploadFileToS3(
+  presignedUrl: string,
+  file: File,
+  contentType: string = 'video/mp4',
+  onProgress?: (percent: number) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', presignedUrl);
+    xhr.setRequestHeader('Content-Type', contentType);
+
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          onProgress(percent);
+        }
+      };
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+      } else {
+        reject(new Error(`Direct storage upload failed with HTTP status ${xhr.status}`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error('Network error during direct storage upload'));
+    xhr.send(file);
+  });
+}
+
 export function uploadVideo(
   file: File,
   onProgress?: (percent: number) => void
@@ -145,3 +195,48 @@ export function getClipSrtUrl(jobId: string, clipId: string): string {
 export function getJobZipDownloadUrl(jobId: string): string {
   return `${API_BASE}/jobs/${jobId}/download-all`;
 }
+
+export function connectJobWebSocket(
+  jobId: string,
+  onUpdate: (job: Job) => void,
+  onError?: (err: any) => void
+): () => void {
+  let wsUrl = '';
+  if (API_BASE.startsWith('http://')) {
+    wsUrl = API_BASE.replace('http://', 'ws://');
+  } else if (API_BASE.startsWith('https://')) {
+    wsUrl = API_BASE.replace('https://', 'wss://');
+  } else {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsUrl = `${protocol}//${window.location.host}${API_BASE}`;
+  }
+  const fullWsUrl = `${wsUrl}/ws/jobs/${jobId}`;
+
+  let isClosed = false;
+  let socket: WebSocket | null = null;
+
+  try {
+    socket = new WebSocket(fullWsUrl);
+    socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        onUpdate(data);
+      } catch (e) {
+        console.error('Failed to parse WS job message:', e);
+      }
+    };
+    socket.onerror = (e) => {
+      if (onError && !isClosed) onError(e);
+    };
+  } catch (err) {
+    if (onError) onError(err);
+  }
+
+  return () => {
+    isClosed = true;
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      socket.close();
+    }
+  };
+}
+

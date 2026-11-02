@@ -53,7 +53,7 @@ export interface Job {
   original_filename: string;
   input_path: string;
   output_dir: string;
-  status: 'queued' | 'analyzing' | 'cutting' | 'completed' | 'failed' | 'cancelled';
+  status: 'queued' | 'downloading' | 'analyzing' | 'cutting' | 'completed' | 'failed' | 'cancelled';
   progress: number;
   stage: string;
   created_at: number;

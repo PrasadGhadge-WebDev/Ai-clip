@@ -33,3 +33,4 @@ services:
           type: web
           name: clipforge-backend
           property: host
+
