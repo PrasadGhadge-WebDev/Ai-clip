@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import settings, UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR, BASE_DIR
-from .ffmpeg_utils import get_ffmpeg_path, get_video_metadata, generate_sample_video
+from .ffmpeg_utils import get_ffmpeg_path, get_video_metadata, generate_sample_video, detect_hardware_acceleration
 from .transcriber import is_whisper_available, WHISPER_LIMITATIONS_DISCLOSURE
 from .silence_detector import SILENCE_REMOVAL_EXPLANATION
 from .job_manager import job_manager
@@ -125,13 +125,19 @@ class JobCreateRequest(BaseModel):
     enable_subtitles: bool = Field(default=False)
     whisper_model: str = Field(default="tiny")
     max_clips: int = Field(default=6)
+    # Encoding & Performance Tuning (Requirement 2 & 10)
+    encoding_preset: Optional[str] = Field(default="veryfast", description="'ultrafast' | 'superfast' | 'veryfast' | 'faster' | 'medium'")
+    crf: Optional[int] = Field(default=24, ge=16, le=35)
+    allow_stream_copy: Optional[bool] = Field(default=True)
+    fast_mode: Optional[bool] = Field(default=True)
 
 
 @app.get("/api/health")
 async def get_system_health():
-    """Returns system status, FFmpeg path, Whisper availability, and disk usage."""
+    """Returns system status, FFmpeg path, Whisper availability, hardware acceleration, and disk usage."""
     ffmpeg_path = get_ffmpeg_path()
     whisper_ok = is_whisper_available()
+    hw_info = detect_hardware_acceleration()
     
     total_b, used_b, free_b = shutil.disk_usage(str(UPLOAD_DIR))
 
@@ -142,6 +148,11 @@ async def get_system_health():
         "ffmpeg": {
             "path": ffmpeg_path,
             "installed": bool(ffmpeg_path and Path(ffmpeg_path).exists())
+        },
+        "hardware_acceleration": hw_info,
+        "concurrency": {
+            "max_workers": settings.max_worker_concurrency,
+            "cpu_cores": os.cpu_count() or 2
         },
         "whisper": {
             "available": whisper_ok,

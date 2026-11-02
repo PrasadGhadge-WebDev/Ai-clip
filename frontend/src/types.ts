@@ -31,6 +31,10 @@ export interface JobOptions {
   silence_duration: number;
   enable_subtitles: boolean;
   whisper_model: string;
+  encoding_preset?: 'ultrafast' | 'superfast' | 'veryfast' | 'faster' | 'medium';
+  crf?: number;
+  allow_stream_copy?: boolean;
+  fast_mode?: boolean;
 }
 
 export interface Clip {
@@ -75,6 +79,15 @@ export interface SystemHealth {
   ffmpeg: {
     path: string;
     installed: boolean;
+  };
+  hardware_acceleration?: {
+    encoder: string;
+    hw_type: string;
+    is_hardware: boolean;
+  };
+  concurrency?: {
+    max_workers: number;
+    cpu_cores: number;
   };
   whisper: {
     available: boolean;

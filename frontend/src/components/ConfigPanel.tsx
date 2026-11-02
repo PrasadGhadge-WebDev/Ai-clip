@@ -495,6 +495,53 @@ export const ConfigPanel: FC<ConfigPanelProps> = ({
               />
               <span className="text-[10px] text-zinc-400 mt-1 block">PySceneDetect (Default: 27.0)</span>
             </div>
+
+            <div>
+              <label className="text-[11px] font-semibold text-zinc-400 block mb-1">
+                FFmpeg Encoding Preset
+              </label>
+              <select
+                value={options.encoding_preset || 'veryfast'}
+                onChange={(e) => onChange({ ...options, encoding_preset: e.target.value as any })}
+                className="w-full bg-[#181a26] border border-[#2e3346] rounded-lg px-2.5 py-1.5 text-xs text-white"
+              >
+                <option value="ultrafast">⚡ Ultrafast (Maximum Speed)</option>
+                <option value="superfast">🚀 Superfast</option>
+                <option value="veryfast">⚖️ Veryfast (Balanced Default)</option>
+                <option value="faster">🎯 Faster</option>
+                <option value="medium">💎 Medium (Studio Quality)</option>
+              </select>
+              <span className="text-[10px] text-zinc-400 mt-1 block">H.264 Encoder Speed</span>
+            </div>
+
+            <div>
+              <label className="text-[11px] font-semibold text-zinc-400 block mb-1">
+                Quality Factor (CRF: 18-30)
+              </label>
+              <input
+                type="number"
+                min="18"
+                max="32"
+                step="1"
+                value={options.crf ?? 24}
+                onChange={(e) => onChange({ ...options, crf: Number(e.target.value) })}
+                className="w-full bg-[#181a26] border border-[#2e3346] rounded-lg px-2.5 py-1.5 text-xs text-white"
+              />
+              <span className="text-[10px] text-zinc-400 mt-1 block">Lower = higher quality (24 is optimal)</span>
+            </div>
+
+            <div className="flex items-center gap-2 pt-4">
+              <input
+                type="checkbox"
+                id="allow_stream_copy"
+                checked={options.allow_stream_copy ?? true}
+                onChange={(e) => onChange({ ...options, allow_stream_copy: e.target.checked })}
+                className="w-4 h-4 rounded text-indigo-600 bg-[#181a26] border-[#2e3346]"
+              />
+              <label htmlFor="allow_stream_copy" className="text-[11px] font-medium text-zinc-300 cursor-pointer">
+                Allow Stream Copy (-c copy) when format matches
+              </label>
+            </div>
           </div>
         )}
       </div>

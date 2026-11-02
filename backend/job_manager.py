@@ -1,3 +1,4 @@
+import os
 import json
 import uuid
 import time
@@ -22,8 +23,10 @@ logger = logging.getLogger("clipforge.jobmanager")
 STATE_FILE = DATA_DIR / "jobs_state.json"
 
 class JobManager:
-    def __init__(self, max_workers: int = 2):
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+    def __init__(self, max_workers: Optional[int] = None):
+        workers = max_workers or settings.max_worker_concurrency
+        logger.info(f"Initializing JobManager thread pool with {workers} worker(s) (CPU count: {os.cpu_count()})")
+        self.executor = ThreadPoolExecutor(max_workers=workers)
         self.jobs: Dict[str, Dict[str, Any]] = {}
         self.lock = threading.Lock()
         self.listeners: List[Any] = []
@@ -102,6 +105,42 @@ class JobManager:
     ) -> Dict[str, Any]:
         if options is None:
             options = {}
+
+        # 1. OPTIMIZATION: Prevent Duplicate Processing (Requirement 7)
+        source_key = str(input_file_path) if input_file_path else (video_url or s3_key or "")
+        match_params = (
+            source_key,
+            options.get("cut_method", "scene"),
+            options.get("aspect_ratio", "9:16"),
+            options.get("crop_mode", "blur_padding"),
+            options.get("resolution", "1080p"),
+            float(options.get("target_duration", 30.0))
+        )
+
+        with self.lock:
+            for existing_id, existing_job in self.jobs.items():
+                e_src = existing_job.get("input_path") or existing_job.get("video_url") or existing_job.get("s3_key") or ""
+                e_opts = existing_job.get("options", {})
+                e_params = (
+                    str(e_src),
+                    e_opts.get("cut_method"),
+                    e_opts.get("aspect_ratio"),
+                    e_opts.get("crop_mode"),
+                    e_opts.get("resolution"),
+                    float(e_opts.get("target_duration", 30.0))
+                )
+                if match_params == e_params:
+                    # If an identical job is currently in progress, return it instead of spawning a duplicate
+                    if existing_job.get("status") in ("queued", "downloading", "analyzing", "cutting"):
+                        logger.info(f"Duplicate job detected: returning active job {existing_id}")
+                        return existing_job
+                    # If identical job completed and clips still exist, return cached result immediately
+                    if existing_job.get("status") == "completed" and existing_job.get("clips"):
+                        first_clip = Path(existing_job["clips"][0]["file_path"])
+                        if first_clip.exists():
+                            logger.info(f"Identical completed job found: returning cached job {existing_id}")
+                            return existing_job
+
         job_id = str(uuid.uuid4())
         job_dir = OUTPUT_DIR / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +174,11 @@ class JobManager:
                 "enable_subtitles": bool(options.get("enable_subtitles", False)),
                 "whisper_model": options.get("whisper_model", "tiny"),
                 "max_clips": int(options.get("max_clips", 6)),
+                # Performance & Quality Configuration (Requirement 2 & 10)
+                "encoding_preset": options.get("encoding_preset", settings.default_encoding_preset),
+                "crf": int(options.get("crf", settings.default_crf)),
+                "allow_stream_copy": bool(options.get("allow_stream_copy", True)),
+                "fast_mode": bool(options.get("fast_mode", True)),
             },
             "clips": [],
             "logs": [],
@@ -314,15 +358,16 @@ class JobManager:
             # 1. SEGMENTATION STRATEGY
             # ----------------------------------------------------
             if cut_method == "scene":
-                self.update_job(job_id, progress=15, stage="Detecting visual scene transitions with PySceneDetect")
-                self.add_log(job_id, f"Running PySceneDetect (threshold={opts['scene_threshold']})...")
+                self.update_job(job_id, progress=15, stage="Detecting visual scene transitions with PySceneDetect (Fast Proxy Mode)")
+                self.add_log(job_id, f"Running PySceneDetect (threshold={opts['scene_threshold']}, frame_skip={settings.scene_frame_skip})...")
                 raw_intervals = detect_scenes(
                     input_path,
                     threshold=opts["scene_threshold"],
                     min_scene_len_sec=opts["min_duration"],
                     max_scene_len_sec=opts["max_duration"],
                     target_duration=opts["target_duration"],
-                    video_duration=duration
+                    video_duration=duration,
+                    frame_skip=settings.scene_frame_skip
                 )
 
             elif cut_method == "silence":
@@ -418,7 +463,7 @@ class JobManager:
 
                 self.add_log(job_id, f"Processing clip {idx}/{total_clips}: [{start_s:.1f}s - {end_s:.1f}s]")
 
-                # Render video with FFmpeg
+                # Render video with FFmpeg (Optimized preset, CRF, and Stream Copy support)
                 cut_clip(
                     input_path=input_path,
                     output_path=clip_path,
@@ -429,7 +474,11 @@ class JobManager:
                     resolution=opts["resolution"],
                     src_width=src_w,
                     src_height=src_h,
-                    has_audio=has_audio
+                    has_audio=has_audio,
+                    encoding_preset=opts.get("encoding_preset", settings.default_encoding_preset),
+                    crf=int(opts.get("crf", settings.default_crf)),
+                    allow_stream_copy=bool(opts.get("allow_stream_copy", True)),
+                    use_hwaccel=settings.enable_hwaccel
                 )
 
                 # Generate thumbnail

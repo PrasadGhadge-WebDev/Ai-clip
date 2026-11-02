@@ -162,13 +162,13 @@ export const SystemStatusModal: FC<SystemStatusModalProps> = ({
             </div>
           ) : (
             <>
-              {/* FFmpeg Status */}
+              {/* FFmpeg & Hardware Acceleration Status */}
               <div className="p-4 rounded-xl bg-[#141620] border border-[#272b38] space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <Cpu className="w-4 h-4 text-indigo-400" />
                     <span className="text-xs font-bold text-white uppercase tracking-wider">
-                      FFmpeg Core Engine
+                      FFmpeg Engine & Hardware Acceleration
                     </span>
                   </div>
                   <span className="flex items-center gap-1 text-[11px] font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
@@ -176,10 +176,22 @@ export const SystemStatusModal: FC<SystemStatusModalProps> = ({
                   </span>
                 </div>
                 <p className="text-xs text-zinc-300">
-                  Binary Path: <code className="text-indigo-300 text-[11px] font-mono break-all">{health.ffmpeg.path}</code>
+                  Active Encoder:{' '}
+                  <code className="text-indigo-300 text-[11px] font-mono font-bold">
+                    {health.hardware_acceleration?.encoder || 'libx264'} (
+                    {health.hardware_acceleration?.is_hardware
+                      ? `Hardware GPU: ${health.hardware_acceleration.hw_type.toUpperCase()}`
+                      : 'CPU Software'}
+                    )
+                  </code>
                 </p>
+                {health.concurrency && (
+                  <p className="text-[11px] text-zinc-400">
+                    Concurrency Pool: <span className="text-zinc-200 font-semibold">{health.concurrency.max_workers} background worker(s)</span> optimized for {health.concurrency.cpu_cores} CPU core(s).
+                  </p>
+                )}
                 <p className="text-[11px] text-zinc-400">
-                  FFmpeg handles video decoding, aspect ratio filters (split, boxblur, crop, pad), audio normalization, and faststart MP4 rendering.
+                  Binary Path: <code className="text-zinc-400 text-[10px] font-mono break-all">{health.ffmpeg.path}</code>
                 </p>
               </div>
 

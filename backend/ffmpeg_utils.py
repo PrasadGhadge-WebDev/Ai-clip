@@ -8,6 +8,8 @@ from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("clipforge.ffmpeg")
 
+_hw_accel_cache: Optional[Dict[str, Any]] = None
+
 def get_ffmpeg_path() -> str:
     """Finds the FFmpeg executable path reliably on Windows and other OS."""
     # 1. Custom configured path
@@ -42,6 +44,71 @@ def get_ffprobe_path() -> Optional[str]:
     if which_path:
         return which_path
     return None
+
+
+def detect_hardware_acceleration() -> Dict[str, Any]:
+    """
+    Detects and safely tests available hardware-accelerated video encoders:
+    - Intel Quick Sync Video (h264_qsv)
+    - NVIDIA NVENC (h264_nvenc)
+    - AMD AMF (h264_amf)
+    - Apple VideoToolbox (h264_videotoolbox)
+    - Linux VAAPI (h264_vaapi)
+    Falls back gracefully to CPU libx264 if hardware acceleration is unavailable.
+    """
+    global _hw_accel_cache
+    if _hw_accel_cache is not None:
+        return _hw_accel_cache
+
+    env_hw = os.getenv("ENABLE_HWACCEL", "true").lower()
+    if env_hw in ("false", "0", "no"):
+        _hw_accel_cache = {
+            "encoder": "libx264",
+            "hw_type": "cpu",
+            "is_hardware": False,
+            "extra_args": ["-preset", "veryfast", "-crf", "24"]
+        }
+        return _hw_accel_cache
+
+    ffmpeg = get_ffmpeg_path()
+    candidates = [
+        ("h264_qsv", "qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "25"]),
+        ("h264_nvenc", "nvenc", ["-c:v", "h264_nvenc", "-preset", "p1", "-cq", "24"]),
+        ("h264_amf", "amf", ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", "24"]),
+        ("h264_videotoolbox", "videotoolbox", ["-c:v", "h264_videotoolbox", "-q:v", "65"]),
+        ("h264_vaapi", "vaapi", ["-vaapi_device", "/dev/dri/renderD128", "-c:v", "h264_vaapi"]),
+    ]
+
+    selected_encoder = "libx264"
+    selected_extra_args = ["-preset", "veryfast", "-crf", "24"]
+    hw_type = "cpu"
+
+    for enc_name, type_label, extra in candidates:
+        try:
+            # 1-frame test probe
+            test_cmd = [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.04",
+                *extra,
+                "-f", "null", "-"
+            ]
+            res = subprocess.run(test_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0)
+            if res.returncode == 0:
+                selected_encoder = enc_name
+                selected_extra_args = extra
+                hw_type = type_label
+                logger.info(f"Hardware acceleration verified: using {enc_name} ({type_label.upper()})")
+                break
+        except Exception:
+            continue
+
+    _hw_accel_cache = {
+        "encoder": selected_encoder,
+        "hw_type": hw_type,
+        "is_hardware": (selected_encoder != "libx264"),
+        "extra_args": selected_extra_args
+    }
+    return _hw_accel_cache
 
 
 def get_video_metadata(file_path: Path) -> Dict[str, Any]:
@@ -110,9 +177,8 @@ def build_filter_chain(
     src_height: int = 1080
 ) -> Tuple[int, int, str]:
     """
-    Constructs FFmpeg video filter for aspect ratio framing and resizing.
-    Supported target_aspect: '9:16', '16:9', '1:1'.
-    Supported crop_mode: 'blur_padding', 'center_crop', 'fit_pad'.
+    Constructs high-performance FFmpeg video filter for aspect ratio framing and resizing.
+    Optimized with fast bilinear downscaling for blur background and sharp bicubic foreground.
     """
     # Determine target width and height
     if target_aspect == "9:16":
@@ -123,28 +189,27 @@ def build_filter_chain(
         out_w, out_h = (1920, 1080) if resolution == "1080p" else (1280, 720)
 
     # 1. Blur Padding Mode (Signature modern TikTok / Reels style)
-    # Background: downscale and apply blur for ultra-fast silky bokeh
-    # Foreground: scale to fit within canvas preserving aspect ratio
-    # Overlay foreground on centered background
+    # Background: downscaled thumbnail scale with bilinear interpolation + fast boxblur(4:1)
+    # Foreground: bicubic scaled sharp overlay
     if crop_mode == "blur_padding":
         bg_w = max(160, out_w // 4)
         bg_h = max(160, out_h // 4)
         vf = (
             f"[0:v]split=2[fg_in][bg_in];"
-            f"[bg_in]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase,crop={bg_w}:{bg_h},boxblur=8:2,scale={out_w}:{out_h}[bg];"
-            f"[fg_in]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[fg];"
+            f"[bg_in]scale={bg_w}:{bg_h}:force_original_aspect_ratio=increase:flags=bilinear,crop={bg_w}:{bg_h},boxblur=4:1,scale={out_w}:{out_h}:flags=bilinear[bg];"
+            f"[fg_in]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=bicubic[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
         )
     # 2. Smart Center Crop Mode
     elif crop_mode == "center_crop":
         vf = (
-            f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+            f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=bicubic,"
             f"crop={out_w}:{out_h}"
         )
     # 3. Fit Pad Mode (Letterbox/Pillarbox with clean dark borders)
     else:
         vf = (
-            f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+            f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:flags=bicubic,"
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black"
         )
 
@@ -161,15 +226,52 @@ def cut_clip(
     resolution: str = "1080p",
     src_width: int = 1920,
     src_height: int = 1080,
-    has_audio: bool = True
+    has_audio: bool = True,
+    encoding_preset: str = "veryfast",
+    crf: int = 24,
+    threads: int = 0,
+    allow_stream_copy: bool = True,
+    use_hwaccel: bool = True
 ) -> Path:
     """
-    Renders an individual clip between start_time and end_time with specified aspect ratio framing.
-    Uses H.264 + AAC with +faststart for immediate browser streaming.
+    Renders an individual clip between start_time and end_time.
+    - Uses ultra-fast stream copy (-c copy) when aspect ratio and crop do not require filter re-encoding.
+    - Uses hardware-accelerated encoder (NVENC/QSV/AMF) if available with CPU fallback.
+    - Configurable encoding preset, threads, and CRF.
     """
     ffmpeg = get_ffmpeg_path()
     duration = max(0.5, end_time - start_time)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 1. OPTIMIZATION: Check if Stream Copy (-c copy) can be used (Requirement 3)
+    # If aspect ratio matches source or target is 16:9 fit_pad and source is ~16:9,
+    # we can bypass video/audio re-encoding completely (100x speedup).
+    src_ar = src_width / max(1, src_height)
+    is_source_16_9 = abs(src_ar - (16 / 9)) < 0.05
+    can_stream_copy = (
+        allow_stream_copy
+        and (target_aspect == "original" or (target_aspect == "16:9" and crop_mode == "fit_pad" and is_source_16_9))
+    )
+
+    if can_stream_copy:
+        copy_cmd = [
+            ffmpeg,
+            "-y",
+            "-ss", f"{start_time:.3f}",
+            "-t", f"{duration:.3f}",
+            "-i", str(input_path),
+            "-c:v", "copy",
+            "-c:a", "copy" if has_audio else "an",
+            "-movflags", "+faststart",
+            str(output_path)
+        ]
+        logger.info(f"Attempting ultra-fast stream copy: {start_time:.2f}s - {end_time:.2f}s -> {output_path.name}")
+        res = subprocess.run(copy_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
+        if res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1000:
+            return output_path
+        logger.info("Stream copy fallback to filter re-encode.")
+
+    # 2. Build optimized filter chain
     out_w, out_h, vf = build_filter_chain(
         target_aspect=target_aspect,
         crop_mode=crop_mode,
@@ -178,8 +280,33 @@ def cut_clip(
         src_height=src_height
     )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # 3. Hardware acceleration or fast CPU encoder (Requirement 2 & 11)
+    hw_info = detect_hardware_acceleration() if use_hwaccel else {"is_hardware": False}
+    
+    # Try Hardware Encoder if available
+    if hw_info.get("is_hardware"):
+        hw_cmd = [
+            ffmpeg,
+            "-y",
+            "-ss", f"{start_time:.3f}",
+            "-t", f"{duration:.3f}",
+            "-i", str(input_path),
+            "-filter_complex", vf,
+            *hw_info["extra_args"],
+            "-pix_fmt", "yuv420p",
+        ]
+        if has_audio:
+            hw_cmd.extend(["-c:a", "aac", "-b:a", "128k", "-ar", "44100"])
+        else:
+            hw_cmd.extend(["-an"])
+        hw_cmd.extend(["-movflags", "+faststart", str(output_path)])
 
+        res = subprocess.run(hw_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
+        if res.returncode == 0 and output_path.exists():
+            return output_path
+        logger.warning(f"Hardware encode failed ({res.stderr[-200:]}), falling back to CPU libx264")
+
+    # Standard CPU libx264 with optimized preset & multi-threading
     cmd = [
         ffmpeg,
         "-y",
@@ -188,8 +315,10 @@ def cut_clip(
         "-i", str(input_path),
         "-filter_complex", vf,
         "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "24",
+        "-preset", encoding_preset,
+        "-crf", str(crf),
+        "-tune", "fastdecode",
+        "-threads", str(threads),
         "-pix_fmt", "yuv420p",
     ]
 
@@ -200,7 +329,7 @@ def cut_clip(
 
     cmd.extend(["-movflags", "+faststart", str(output_path)])
 
-    logger.info(f"Rendering clip: {start_time:.2f}s - {end_time:.2f}s -> {output_path.name}")
+    logger.info(f"Rendering clip ({encoding_preset}, crf={crf}): {start_time:.2f}s - {end_time:.2f}s -> {output_path.name}")
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
 
     if res.returncode != 0:
@@ -211,7 +340,7 @@ def cut_clip(
 
 
 def generate_thumbnail(video_path: Path, thumbnail_path: Path, timestamp: float = 1.0) -> Path:
-    """Extracts a single frame as JPEG thumbnail for quick preview."""
+    """Extracts a single frame as JPEG thumbnail for quick preview with zero audio decoding."""
     ffmpeg = get_ffmpeg_path()
     thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -221,7 +350,8 @@ def generate_thumbnail(video_path: Path, thumbnail_path: Path, timestamp: float 
         "-ss", f"{timestamp:.3f}",
         "-i", str(video_path),
         "-frames:v", "1",
-        "-q:v", "2",
+        "-an",
+        "-q:v", "3",
         str(thumbnail_path)
     ]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
@@ -230,15 +360,12 @@ def generate_thumbnail(video_path: Path, thumbnail_path: Path, timestamp: float 
 
 def generate_sample_video(output_path: Path, duration_secs: int = 15) -> Path:
     """
-    Generates a synthetic demo MP4 video with color transitions, animated clock,
-    and synthesized audio speech-like tones so users can test ClipForge AI
-    instantly on Windows with 0 file downloads!
+    Generates a synthetic demo MP4 video with color transitions and audio tone
+    using ultrafast encoding.
     """
     ffmpeg = get_ffmpeg_path()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Filter creates a 1280x720 video with changing background colors every 4 seconds,
-    # timestamp test pattern, and a sine audio track with brief silence pauses
     filter_graph = (
         f"testsrc=duration={duration_secs}:size=1280x720:rate=30,"
         f"drawbox=y=ih-80:color=black@0.6:width=iw:height=80:t=fill"
@@ -260,7 +387,6 @@ def generate_sample_video(output_path: Path, duration_secs: int = 15) -> Path:
 
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
     if res.returncode != 0:
-        # Fallback simpler testsrc if drawbox has issues on some ffmpeg builds
         simple_cmd = [
             ffmpeg,
             "-y",
