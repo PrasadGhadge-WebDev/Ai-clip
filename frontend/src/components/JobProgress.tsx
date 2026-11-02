@@ -20,7 +20,7 @@ interface JobProgressProps {
 export const JobProgress: FC<JobProgressProps> = ({ job, onCancel, onRetry }) => {
   const [showLogs, setShowLogs] = useState(false);
 
-  const isRunning = ['queued', 'analyzing', 'cutting'].includes(job.status);
+  const isRunning = ['queued', 'downloading', 'analyzing', 'cutting'].includes(job.status);
   const isCompleted = job.status === 'completed';
   const isFailed = job.status === 'failed';
   const isCancelled = job.status === 'cancelled';

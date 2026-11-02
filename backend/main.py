@@ -86,6 +86,7 @@ job_manager.register_listener(on_job_state_changed)
 
 # CORS Middleware
 cors_origins = settings.cors_origins
+exposed_hdrs = ["Content-Range", "Accept-Ranges", "Content-Length", "Content-Disposition"]
 if "*" in cors_origins:
     app.add_middleware(
         CORSMiddleware,
@@ -93,6 +94,7 @@ if "*" in cors_origins:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=exposed_hdrs,
     )
 else:
     app.add_middleware(
@@ -102,6 +104,7 @@ else:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=exposed_hdrs,
     )
 
 

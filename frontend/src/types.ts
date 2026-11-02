@@ -14,6 +14,8 @@ export interface UploadResponse {
   filename: string;
   file_size: number;
   metadata: VideoMetadata;
+  video_url?: string;
+  s3_key?: string;
 }
 
 export interface JobOptions {

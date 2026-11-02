@@ -80,7 +80,10 @@ Recommended Cloud Architecture:
 6. Click **Deploy**.
 7. Your frontend will be live on `https://your-project.vercel.app`!
 
-*(Optional: Go back to Render Dashboard &rarr; Environment &rarr; set `CORS_ORIGINS=https://your-project.vercel.app` for strict security).*
+> ⚠️ **CRITICAL NOTE ON VIDEO UPLOAD BUFFERING**:
+> If you deploy on Vercel without setting `VITE_API_BASE_URL`, the frontend defaults to relative `/api`. Because Vercel has a strict 4.5MB Serverless function payload limit and does not run Python, uploads will hang/buffer infinitely or return HTML errors. Setting `VITE_API_BASE_URL` routes uploads directly to your Render backend or S3 bucket, completely bypassing the Vercel 4.5MB bottleneck.
+
+*(Optional: Go back to Render Dashboard &rarr; Environment &rarr; set `CORS_ORIGINS=*` or `https://your-project.vercel.app` for strict security).*
 
 ---
 

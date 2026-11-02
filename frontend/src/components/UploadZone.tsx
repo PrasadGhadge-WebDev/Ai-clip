@@ -15,7 +15,14 @@ import {
   FileVideo,
 } from 'lucide-react';
 import type { UploadResponse } from '../types';
-import { uploadVideo, generateSyntheticSample, fetchVideoFromUrl } from '../api';
+import {
+  uploadVideo,
+  uploadFileToS3,
+  requestPresignedUrl,
+  generateSyntheticSample,
+  isBackendConfigured,
+  getApiBase,
+} from '../api';
 
 interface UploadZoneProps {
   currentUpload: UploadResponse | null;
@@ -32,10 +39,10 @@ export const UploadZone: FC<UploadZoneProps> = ({
 }) => {
   const [uploadMode, setUploadMode] = useState<'file' | 'link'>('file');
   const [videoUrl, setVideoUrl] = useState('');
-  const [fetchingLink, setFetchingLink] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadPercent, setUploadPercent] = useState(0);
+  const [uploadStage, setUploadStage] = useState<string>('Preparing...');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [generatingSample, setGeneratingSample] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -59,19 +66,66 @@ export const UploadZone: FC<UploadZoneProps> = ({
       return;
     }
 
+    if (!isBackendConfigured()) {
+      setErrorMessage(
+        'Backend server not connected. On Vercel, direct video uploads fail because of Vercel’s 4.5MB serverless limit. Please set VITE_API_BASE_URL to your deployed Python backend (e.g., Render).'
+      );
+      return;
+    }
+
     try {
       setUploading(true);
       setUploadPercent(0);
-      const res = await uploadVideo(file, (pct) => setUploadPercent(pct));
-      onUploadSuccess(res);
+      setUploadStage('Checking storage options...');
+
+      // 1. Try S3 pre-signed direct upload first (bypasses Vercel and backend proxy)
+      let presignedInfo: { supported: boolean; upload_url?: string; object_key?: string } | null = null;
+      try {
+        presignedInfo = await requestPresignedUrl(file.name, file.type || 'video/mp4', file.size);
+      } catch (err) {
+        console.info('Pre-signed URL endpoint not configured or skipped, using direct backend upload:', err);
+      }
+
+      if (presignedInfo && presignedInfo.supported && presignedInfo.upload_url && presignedInfo.object_key) {
+        setUploadStage('Direct Cloud Storage Upload (Bypassing Vercel 4.5MB Limit)...');
+        await uploadFileToS3(presignedInfo.upload_url, file, file.type || 'video/mp4', (pct) => {
+          setUploadPercent(pct);
+        });
+
+        onUploadSuccess({
+          file_id: '',
+          s3_key: presignedInfo.object_key,
+          filename: file.name,
+          file_size: file.size,
+          metadata: {
+            duration_seconds: 0,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            has_audio: true,
+            video_codec: 'h264',
+            audio_codec: 'aac',
+            file_size_bytes: file.size,
+          },
+        });
+      } else {
+        // 2. Direct upload to separate Python backend (supports large multipart uploads)
+        setUploadStage('Uploading to Python Backend Server (FFmpeg)...');
+        const res = await uploadVideo(file, (pct) => {
+          setUploadPercent(pct);
+        });
+        onUploadSuccess(res);
+      }
     } catch (err: any) {
       setErrorMessage(err.message || 'Failed to upload video');
     } finally {
       setUploading(false);
+      setUploadPercent(0);
+      setUploadStage('Preparing...');
     }
   };
 
-  const handleImportLink = async (e?: FormEvent) => {
+  const handleImportLink = (e?: FormEvent) => {
     if (e) e.preventDefault();
     const trimmed = videoUrl.trim();
     if (!trimmed) {
@@ -85,16 +139,33 @@ export const UploadZone: FC<UploadZoneProps> = ({
     }
 
     setErrorMessage(null);
-    setFetchingLink(true);
+
+    let domain = 'Online Video';
     try {
-      const res = await fetchVideoFromUrl(trimmed);
-      onUploadSuccess(res);
-      setVideoUrl('');
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to download video from the provided link.');
-    } finally {
-      setFetchingLink(false);
+      const u = new URL(trimmed);
+      domain = u.hostname.replace('www.', '');
+    } catch {
+      // ignore
     }
+
+    // Attach link immediately: background worker will download and cut asynchronously!
+    onUploadSuccess({
+      file_id: '',
+      video_url: trimmed,
+      filename: `${domain} Stream`,
+      file_size: 0,
+      metadata: {
+        duration_seconds: 0,
+        width: 1920,
+        height: 1080,
+        fps: 30,
+        has_audio: true,
+        video_codec: 'h264',
+        audio_codec: 'aac',
+        file_size_bytes: 0,
+      },
+    });
+    setVideoUrl('');
   };
 
   const handleDrop = (e: DragEvent) => {
@@ -128,7 +199,7 @@ export const UploadZone: FC<UploadZoneProps> = ({
       const res = await generateSyntheticSample();
       onUploadSuccess(res);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to generate demo sample');
+      setErrorMessage(err.message || 'Failed to generate demo sample. Check that backend is online.');
     } finally {
       setGeneratingSample(false);
     }
@@ -143,6 +214,7 @@ export const UploadZone: FC<UploadZoneProps> = ({
   };
 
   const formatSeconds = (sec: number) => {
+    if (!sec) return 'Auto';
     const mins = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);
     return `${mins}:${s < 10 ? '0' : ''}${s}`;
@@ -167,25 +239,46 @@ export const UploadZone: FC<UploadZoneProps> = ({
                     <CheckCircle className="w-3 h-3" /> Ready
                   </span>
                 </div>
+
                 <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-400 mt-1.5">
-                  <span className="bg-zinc-800/80 px-2 py-0.5 rounded text-zinc-300 font-mono">
-                    {formatSeconds(currentUpload.metadata.duration_seconds)} ({currentUpload.metadata.duration_seconds}s)
-                  </span>
-                  <span className="bg-zinc-800/80 px-2 py-0.5 rounded text-zinc-300 font-mono">
-                    {currentUpload.metadata.width} × {currentUpload.metadata.height}
-                  </span>
-                  <span className="bg-zinc-800/80 px-2 py-0.5 rounded text-zinc-300 font-mono">
-                    {formatBytes(currentUpload.file_size)}
-                  </span>
-                  <span className="flex items-center gap-1 text-zinc-300">
-                    {currentUpload.metadata.has_audio ? (
-                      <Volume2 className="w-3.5 h-3.5 text-indigo-400" />
-                    ) : (
-                      <VolumeX className="w-3.5 h-3.5 text-zinc-500" />
-                    )}
-                    {currentUpload.metadata.has_audio ? 'Audio detected' : 'No audio'}
-                  </span>
+                  {currentUpload.video_url ? (
+                    <span className="bg-purple-900/40 text-purple-200 border border-purple-700/50 px-2 py-0.5 rounded font-mono truncate max-w-xs">
+                      URL: {currentUpload.video_url}
+                    </span>
+                  ) : currentUpload.s3_key ? (
+                    <span className="bg-sky-900/40 text-sky-200 border border-sky-700/50 px-2 py-0.5 rounded font-mono">
+                      Cloud Storage Key: {currentUpload.s3_key}
+                    </span>
+                  ) : (
+                    <>
+                      <span className="bg-zinc-800/80 px-2 py-0.5 rounded text-zinc-300 font-mono">
+                        {formatSeconds(currentUpload.metadata.duration_seconds)}
+                      </span>
+                      {currentUpload.metadata.width > 0 && (
+                        <span className="bg-zinc-800/80 px-2 py-0.5 rounded text-zinc-300 font-mono">
+                          {currentUpload.metadata.width} × {currentUpload.metadata.height}
+                        </span>
+                      )}
+                      <span className="bg-zinc-800/80 px-2 py-0.5 rounded text-zinc-300 font-mono">
+                        {formatBytes(currentUpload.file_size)}
+                      </span>
+                      <span className="flex items-center gap-1 text-zinc-300">
+                        {currentUpload.metadata.has_audio ? (
+                          <Volume2 className="w-3.5 h-3.5 text-indigo-400" />
+                        ) : (
+                          <VolumeX className="w-3.5 h-3.5 text-zinc-500" />
+                        )}
+                        {currentUpload.metadata.has_audio ? 'Audio track' : 'No audio'}
+                      </span>
+                    </>
+                  )}
                 </div>
+
+                {currentUpload.video_url && (
+                  <p className="text-[11px] text-zinc-400 mt-2">
+                    ⚡ Video stream will be downloaded and processed in background by the Python worker.
+                  </p>
+                )}
               </div>
             </div>
 
@@ -259,17 +352,20 @@ export const UploadZone: FC<UploadZoneProps> = ({
               {uploading ? (
                 <div className="py-4 max-w-sm mx-auto">
                   <RefreshCw className="w-8 h-8 mx-auto text-indigo-400 animate-spin mb-3" />
-                  <p className="text-sm font-semibold text-white mb-2">
-                    Uploading video... {uploadPercent}%
+                  <p className="text-sm font-semibold text-white mb-1">
+                    {uploadStage}
                   </p>
-                  <div className="w-full bg-[#1e2230] rounded-full h-2 overflow-hidden border border-[#2c3244]">
+                  <p className="text-xs font-mono font-bold text-indigo-300 mb-2">
+                    {uploadPercent}% Uploaded
+                  </p>
+                  <div className="w-full bg-[#1e2230] rounded-full h-2.5 overflow-hidden border border-[#2c3244]">
                     <div
-                      className="bg-gradient-to-r from-indigo-500 to-purple-500 h-full rounded-full transition-all duration-200"
+                      className="bg-gradient-to-r from-indigo-500 via-purple-500 to-indigo-400 h-full rounded-full transition-all duration-200"
                       style={{ width: `${uploadPercent}%` }}
                     />
                   </div>
-                  <p className="text-xs text-zinc-400 mt-2">
-                    Extracting video stream headers & audio tracks...
+                  <p className="text-[11px] text-zinc-400 mt-2">
+                    Streaming large video directly to backend / object storage...
                   </p>
                 </div>
               ) : (
@@ -318,7 +414,7 @@ export const UploadZone: FC<UploadZoneProps> = ({
                 <div>
                   <h3 className="text-sm font-bold text-white">Import from Video URL</h3>
                   <p className="text-xs text-zinc-400">
-                    Paste any public link from YouTube, Vimeo, TikTok, or direct video URL (.mp4).
+                    Paste any public link from YouTube, Vimeo, TikTok, or direct MP4 link.
                   </p>
                 </div>
               </div>
@@ -333,7 +429,6 @@ export const UploadZone: FC<UploadZoneProps> = ({
                     value={videoUrl}
                     onChange={(e) => setVideoUrl(e.target.value)}
                     placeholder="https://www.youtube.com/watch?v=... or direct MP4 link"
-                    disabled={fetchingLink}
                     className="w-full pl-10 pr-4 py-3 bg-[#151724] border border-[#2a2f42] rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all"
                   />
                 </div>
@@ -349,37 +444,26 @@ export const UploadZone: FC<UploadZoneProps> = ({
 
                   <button
                     type="submit"
-                    disabled={fetchingLink || !videoUrl.trim()}
+                    disabled={!videoUrl.trim()}
                     className="px-4 py-2.5 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2 shadow-md shadow-indigo-600/30 transition-all"
                   >
-                    {fetchingLink ? (
-                      <>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Downloading Link...</span>
-                      </>
-                    ) : (
-                      <>
-                        <span>Fetch Video</span>
-                        <ArrowRight className="w-3.5 h-3.5" />
-                      </>
-                    )}
+                    <span>Use Video Link</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
                   </button>
                 </div>
               </form>
-
-              {fetchingLink && (
-                <div className="p-3 rounded-xl bg-indigo-950/30 border border-indigo-800/40 text-indigo-200 text-xs flex items-center gap-2.5 animate-pulse">
-                  <RefreshCw className="w-4 h-4 animate-spin text-indigo-400 shrink-0" />
-                  <span>Connecting to source, extracting video stream & analyzing audio tracks with FFmpeg...</span>
-                </div>
-              )}
             </div>
           )}
 
           {errorMessage && (
-            <div className="p-3 rounded-xl bg-red-950/40 border border-red-800/60 text-red-300 text-xs flex items-center gap-2 text-left">
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-              <span>{errorMessage}</span>
+            <div className="p-3.5 rounded-xl bg-red-950/40 border border-red-800/60 text-red-200 text-xs flex items-start gap-2.5 text-left">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <span className="font-semibold block">{errorMessage}</span>
+                <span className="text-[11px] text-zinc-400 block">
+                  Backend target: <code className="font-mono text-zinc-300">{getApiBase()}</code>
+                </span>
+              </div>
             </div>
           )}
         </div>
@@ -387,4 +471,3 @@ export const UploadZone: FC<UploadZoneProps> = ({
     </div>
   );
 };
-

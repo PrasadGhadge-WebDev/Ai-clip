@@ -179,14 +179,16 @@ class JobManager:
         job = self.get_job(job_id)
         if not job:
             return None
-        input_path = Path(job["input_path"])
-        if not input_path.exists():
+        input_path = Path(job["input_path"]) if job.get("input_path") else None
+        has_source = bool((input_path and input_path.exists()) or job.get("video_url") or job.get("s3_key"))
+        if not has_source:
             return None
 
         # Reset job state
+        initial_status = "downloading" if (job.get("video_url") or job.get("s3_key")) else "queued"
         self.update_job(
             job_id,
-            status="queued",
+            status=initial_status,
             progress=0,
             stage="Retrying job...",
             error=None,

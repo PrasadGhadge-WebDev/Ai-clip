@@ -22,15 +22,20 @@ import {
   retryJob,
   deleteJob,
   generateSyntheticSample,
+  connectJobWebSocket,
+  getApiBase,
 } from './api';
 import {
   Trash2,
   RefreshCw,
   FolderOpen,
+  AlertTriangle,
+  Settings,
 } from 'lucide-react';
 
 export function App() {
   const [health, setHealth] = useState<SystemHealth | null>(null);
+  const [backendError, setBackendError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'studio' | 'jobs'>('studio');
   const [currentUpload, setCurrentUpload] = useState<UploadResponse | null>(null);
   const [currentJob, setCurrentJob] = useState<Job | null>(null);
@@ -61,6 +66,7 @@ export function App() {
     try {
       const h = await fetchHealth();
       setHealth(h);
+      setBackendError(null);
       const jobs = await fetchJobs();
       setJobsList(jobs);
       // If there's an ongoing or latest job, pick it
@@ -68,7 +74,9 @@ export function App() {
         setCurrentJob((prev) => prev || jobs[0]);
       }
     } catch (err: any) {
-      console.error('Initialization error:', err);
+      console.warn('Backend connectivity warning:', err);
+      setHealth(null);
+      setBackendError(err.message || 'Unable to connect to backend server');
     }
   }, []);
 
@@ -76,13 +84,35 @@ export function App() {
     loadInitialData();
   }, [loadInitialData]);
 
-  // Poll current job if running
+  // Real-time WebSocket + Polling fallback for active job
   useEffect(() => {
     if (!currentJob) return;
-    const isRunning = ['queued', 'analyzing', 'cutting'].includes(currentJob.status);
+    const isRunning = ['queued', 'downloading', 'analyzing', 'cutting'].includes(currentJob.status);
     if (!isRunning) return;
 
     const jobId = currentJob.id;
+
+    // 1. WebSocket live listener for real-time progress
+    const disconnectWs = connectJobWebSocket(
+      jobId,
+      (updatedJob) => {
+        setCurrentJob(updatedJob);
+        setJobsList((prev) => {
+          const idx = prev.findIndex((j) => j.id === updatedJob.id);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = updatedJob;
+            return next;
+          }
+          return [updatedJob, ...prev];
+        });
+      },
+      (err) => {
+        console.debug('WS notice (polling fallback active):', err);
+      }
+    );
+
+    // 2. HTTP Polling fallback (every 2s) to guarantee updates even behind restrictive firewalls
     const interval = setInterval(async () => {
       try {
         const updated = await fetchJob(jobId);
@@ -93,9 +123,12 @@ export function App() {
       } catch (err) {
         console.error('Error polling job:', err);
       }
-    }, 1500);
+    }, 2000);
 
-    return () => clearInterval(interval);
+    return () => {
+      disconnectWs();
+      clearInterval(interval);
+    };
   }, [currentJob?.id, currentJob?.status]);
 
   // Handle Quick Demo generation from header
@@ -107,7 +140,7 @@ export function App() {
       setCurrentUpload(res);
       setActiveTab('studio');
     } catch (err: any) {
-      setGlobalError(err.message || 'Failed to generate demo sample');
+      setGlobalError(err.message || 'Failed to generate demo sample. Check backend connection.');
     } finally {
       setSampleLoading(false);
     }
@@ -119,7 +152,14 @@ export function App() {
     try {
       setIsSubmitting(true);
       setGlobalError(null);
-      const newJob = await createJob(currentUpload.file_id, options);
+      
+      const source = currentUpload.video_url
+        ? { video_url: currentUpload.video_url }
+        : currentUpload.s3_key
+        ? { s3_key: currentUpload.s3_key }
+        : { file_id: currentUpload.file_id };
+
+      const newJob = await createJob(source, options);
       setCurrentJob(newJob);
       const jobs = await fetchJobs();
       setJobsList(jobs);
@@ -180,7 +220,43 @@ export function App() {
       />
 
       {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+        {/* Backend Offline / Misconfigured Alert Banner */}
+        {backendError && (
+          <div className="p-4 rounded-2xl bg-amber-950/40 border border-amber-800/60 text-amber-200 text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xl">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-bold text-amber-100">
+                  Backend Server Offline or Not Connected
+                </p>
+                <p className="text-[11px] text-amber-300/90 leading-relaxed">
+                  Frontend is targeting <code className="font-mono bg-amber-900/60 px-1 py-0.5 rounded text-amber-200">{getApiBase()}</code>.
+                  Video uploads and FFmpeg processing require the Python backend to be online.
+                  If deployed on Vercel, set <code className="font-mono">VITE_API_BASE_URL</code> to your Render backend URL.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+              <button
+                onClick={() => setShowSystemModal(true)}
+                className="px-3 py-1.5 rounded-lg bg-amber-900/80 hover:bg-amber-800 text-white font-semibold text-xs flex items-center gap-1.5 transition-colors"
+              >
+                <Settings className="w-3.5 h-3.5" />
+                <span>Configure URL</span>
+              </button>
+              <button
+                onClick={loadInitialData}
+                className="p-1.5 rounded-lg text-amber-300 hover:text-white hover:bg-amber-900/40 transition-colors"
+                title="Retry Connection"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Global Error Banner */}
         {globalError && (
           <div className="p-4 rounded-2xl bg-red-950/50 border border-red-800 text-red-200 text-xs flex items-center justify-between shadow-xl">
@@ -209,7 +285,7 @@ export function App() {
                     <h2 className="text-base font-bold text-white">Source Video File</h2>
                   </div>
                   <p className="text-xs text-zinc-400 mt-1 ml-8">
-                    Select a podcast, gameplay clip, webinar, or long video to repurpose.
+                    Select a podcast, gameplay clip, webinar, or YouTube link to repurpose.
                   </p>
                 </div>
 

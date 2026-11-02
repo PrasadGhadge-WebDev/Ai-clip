@@ -21,7 +21,8 @@ export const Header: FC<HeaderProps> = ({
   setActiveTab,
   jobsCount,
 }) => {
-  const isHealthy = health?.ffmpeg.installed ?? true;
+  const isConnected = Boolean(health);
+  const isHealthy = Boolean(health && health.status === 'healthy' && health.ffmpeg?.installed);
 
   return (
     <header className="sticky top-0 z-40 w-full border-b border-[#272b38] bg-[#0d0e14]/90 backdrop-blur-md">
@@ -97,11 +98,11 @@ export const Header: FC<HeaderProps> = ({
             title="Click to view FFmpeg and system details"
           >
             <span className="relative flex h-2 w-2">
-              <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${isHealthy ? 'bg-emerald-400' : 'bg-amber-400'} opacity-75`}></span>
-              <span className={`relative inline-flex rounded-full h-2 w-2 ${isHealthy ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
+              <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${isHealthy ? 'bg-emerald-400' : isConnected ? 'bg-amber-400' : 'bg-rose-400'} opacity-75`}></span>
+              <span className={`relative inline-flex rounded-full h-2 w-2 ${isHealthy ? 'bg-emerald-500' : isConnected ? 'bg-amber-500' : 'bg-rose-500'}`}></span>
             </span>
             <span className="text-zinc-300 font-medium hidden sm:inline">
-              {isHealthy ? 'Engine Active' : 'Setup Needed'}
+              {isHealthy ? 'Engine Active' : isConnected ? 'Setup Needed' : 'Backend Offline'}
             </span>
             <Activity className="w-3.5 h-3.5 text-zinc-400" />
           </button>
